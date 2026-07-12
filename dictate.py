@@ -52,7 +52,7 @@ SOUND_ERROR = "/System/Library/Sounds/Basso.aiff"
 if IS_APPLE_SILICON:
     PRESETS = {
         "turbo": ("mlx", "mlx-community/whisper-large-v3-turbo"),
-        "large-v3": ("faster", "large-v3"),
+        "large-v3": ("mlx", "mlx-community/whisper-large-v3-mlx"),
     }
 else:
     PRESETS = {
