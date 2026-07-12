@@ -50,9 +50,10 @@ SOUND_ERROR = "/System/Library/Sounds/Basso.aiff"
 # preset: ชื่อในเมนู → (เอนจิน, โมเดล)
 # ชิป M ใช้ GPU (mlx) เร็วกว่า CPU ~4-10 เท่า · เครื่อง Intel ใช้ faster-whisper CPU
 if IS_APPLE_SILICON:
+    # วัดจริง (เสียงไทย 11 วิ): turbo 1.5s · large-v3 4bit 2.5s (แม่น≈ตัวเต็ม แรม 1/3)
     PRESETS = {
         "turbo": ("mlx", "mlx-community/whisper-large-v3-turbo"),
-        "large-v3": ("mlx", "mlx-community/whisper-large-v3-mlx"),
+        "large-v3": ("mlx", "mlx-community/whisper-large-v3-mlx-4bit"),
     }
 else:
     PRESETS = {
