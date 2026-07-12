@@ -1,0 +1,16 @@
+{
+  "preset": "turbo",
+  "language": "th",
+  "hotkey": "alt_l",
+  "mic_substring": "MacBook",
+  "vocab": [
+    "AI", "content", "TikTok", "Instagram", "Facebook", "YouTube",
+    "carousel", "hook", "script", "prompt", "ChatGPT", "Claude", "Claude Code"
+  ],
+  "corrections": {
+    "Clause Code": "Claude Code",
+    "Cloud Code": "Claude Code",
+    "คลอดโค้ด": "Claude Code",
+    "โคลดโค้ด": "Claude Code"
+  }
+}

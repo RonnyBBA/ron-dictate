@@ -1,0 +1,7 @@
+.venv/
+runtime/
+bin/
+dictate.log
+__pycache__/
+*.pyc
+.DS_Store
