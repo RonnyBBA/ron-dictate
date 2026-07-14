@@ -4,7 +4,7 @@
 Ron Dictate — พูดแล้วพิมพ์ ในเครื่องคุณเอง ไม่จำกัดคำ ไม่มีรายเดือน
 by Ronny BBA · https://github.com/RonnyBBA/ron-dictate
 
-ดับเบิลจิ้ม ⌥ Option ซ้าย (2 ทีเร็วๆ) = เริ่มอัด · จิ้มทีเดียว = หยุด+ถอดเสียง · จิ้มตอน ⏳ = ยกเลิก → วางข้อความตรงเคอร์เซอร์
+จิ้ม ⌥ Option ซ้าย 1 ที = เริ่มอัด · จิ้มอีกที = หยุด · จิ้มตอน ⏳ = ยกเลิก · มีเสียงตอบทุกจิ้ม → วางข้อความตรงเคอร์เซอร์
 สถานะบนเมนูบาร์: 💤 พร้อมใช้ · 🎙️ กำลังอัด · ⏳ กำลังโหลด/ถอด · 🚫 พักอยู่
 """
 
@@ -197,7 +197,7 @@ class Dictate(rumps.App):
         self.refresh_menu()
 
         rumps.Timer(self.update_title, 0.25).start()
-        rumps.Timer(self.keep_warm, 600).start()  # กันโมเดลโดนเตะไป swap ตอนเครื่องแรมตึง
+        rumps.Timer(self.keep_warm, 300).start()  # กันโมเดลโดนเตะไป swap ตอนเครื่องแรมตึง
         threading.Thread(target=self.load_model, daemon=True).start()
         threading.Thread(target=self.hotkey_listener, daemon=True).start()
 
@@ -319,14 +319,9 @@ class Dictate(rumps.App):
             self.item_status.title = "❌ ปุ่มลัดใช้ไม่ได้ (ดู dictate.log)"
 
     def on_hotkey(self):
+        # จิ้มทีเดียว = เริ่ม/หยุด (เผลอจิ้มไม่มีพิษแล้ว: ท่อนเงียบถูกข้าม + เงียบนานหยุดเอง)
         if self.state == "idle":
-            # เริ่มอัด = ต้อง "ดับเบิลจิ้ม" (2 ทีภายใน 0.5 วิ) — กันเผลอจิ้มทีเดียวแล้วอัดค้าง
-            now = time.time()
-            if now - self.last_tap <= 0.5:
-                self.last_tap = 0.0
-                self.start_recording()
-            else:
-                self.last_tap = now
+            self.start_recording()
         elif self.state == "recording":
             if self.streaming_on():
                 # โหมดทยอย: แค่เปลี่ยนสถานะ stream_worker จะปิดงานเอง
@@ -338,6 +333,10 @@ class Dictate(rumps.App):
             # ปุ่มฉุกเฉิน: จิ้มระหว่าง ⏳ = ยกเลิกทั้งหมด หยุดวางทันที
             self.cancel = True
             log("ผู้ใช้สั่งยกเลิก (จิ้มระหว่างถอด)")
+            play(SOUND_ERROR)
+        else:
+            # loading/paused — ห้ามเงียบ ต้องมีเสียงบอกว่ายังไม่พร้อม
+            log("จิ้มตอนยังไม่พร้อม (สถานะ: %s)" % self.state)
             play(SOUND_ERROR)
 
     def streaming_on(self):
@@ -366,7 +365,7 @@ class Dictate(rumps.App):
             cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
                    "-f", "avfoundation", "-i", ":" + self.mic,
                    "-ar", "16000", "-ac", "1",
-                   "-f", "segment", "-segment_time", "6", "-reset_timestamps", "1",
+                   "-f", "segment", "-segment_time", "5", "-reset_timestamps", "1",
                    os.path.join(self.seg_dir, "seg_%03d.wav")]
             self.rec_proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
