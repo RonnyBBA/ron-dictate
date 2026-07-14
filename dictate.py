@@ -72,7 +72,7 @@ DEFAULT_CONFIG = {
 
 
 def log(msg):
-    # เขียนลงไฟล์อย่างเดียว — stdout ถูก redirect มาไฟล์เดียวกัน ถ้า print ด้วยจะซ้ำ
+    # เขียนลงไฟล์อย่างเดียว — stdout ของ daemon ถูก redirect มาไฟล์เดียวกัน ถ้า print ด้วยจะซ้ำ
     line = "[%s] %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
     try:
         with open(LOG_PATH, "a") as f:
@@ -121,8 +121,30 @@ def check_permissions():
     return ok
 
 
+def wav_is_silent(path, rms_threshold=250):
+    """เช็คว่าไฟล์ wav เป็นความเงียบ/เสียงจอแจเบาๆ ไหม — เงียบ = ไม่ต้องถอดเลย (กัน Whisper มโนคำ)"""
+    try:
+        import wave, audioop
+        with wave.open(path) as w:
+            frames = w.readframes(w.getnframes())
+        return audioop.rms(frames, 2) < rms_threshold
+    except Exception:
+        return False  # เช็คไม่ได้ = ปล่อยผ่านไปถอดตามปกติ
+
+
+def looks_hallucinated(text):
+    """จับอาการ Whisper มโนคำซ้ำๆ จากความเงียบ (เช่น 'Mess Mess Mess ...')"""
+    words = text.split()
+    if len(words) >= 5 and len(set(words)) <= 2:
+        return True
+    for i in range(len(words) - 4):
+        if len(set(words[i:i + 5])) == 1:
+            return True
+    return False
+
+
 def find_mic(substring):
-    """ถาม ffmpeg ว่ามีไมค์อะไรบ้าง เลือกตัวที่ชื่อตรง substring (ไม่เจอ = ตัวแรก)"""
+    """ถาม ffmpeg ว่ามีไมค์อะไรบ้าง แล้วเลือกตัวที่ชื่อตรง substring (fallback: ตัวแรก)"""
     proc = subprocess.run(
         [FFMPEG, "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
         capture_output=True, text=True,
@@ -155,19 +177,21 @@ class Dictate(rumps.App):
             self.preset = "turbo"
         self.rec_proc = None
         self.rec_path = None
+        self.seg_dir = None
         self.mic = None
+        self.last_tap = 0.0
+        self.cancel = False
         self.kb = keyboard.Controller()
 
         self.item_status = rumps.MenuItem("กำลังโหลดโมเดล...")
         self.item_pause = rumps.MenuItem("พักการใช้งาน", callback=self.toggle_pause)
-        self.item_turbo = rumps.MenuItem("โมเดล: turbo (เร็ว+แม่น · แนะนำ)", callback=lambda _: self.switch_model("turbo"))
-        self.item_large = rumps.MenuItem("โมเดล: large-v3 (แม่นสุด · ช้ากว่ามาก)", callback=lambda _: self.switch_model("large-v3"))
-        self.item_about = rumps.MenuItem("Ron Dictate — by Ronny BBA", callback=self.open_about)
+        self.item_turbo = rumps.MenuItem("โมเดล: turbo (เร็วสุด)", callback=lambda _: self.switch_model("turbo"))
+        self.item_large = rumps.MenuItem("โมเดล: large-v3 (แม่นสุด · แนะนำ)", callback=lambda _: self.switch_model("large-v3"))
+        self.item_stream = rumps.MenuItem("ทยอยพิมพ์ระหว่างพูด", callback=self.toggle_streaming)
         self.menu = [
             self.item_status, None,
-            self.item_pause, None,
+            self.item_pause, self.item_stream, None,
             self.item_turbo, self.item_large, None,
-            self.item_about,
             rumps.MenuItem("Quit", callback=self.do_quit),
         ]
         self.refresh_menu()
@@ -197,7 +221,6 @@ class Dictate(rumps.App):
         except Exception:
             pass
 
-
     # ---------- UI ----------
 
     def update_title(self, _timer=None):
@@ -212,18 +235,16 @@ class Dictate(rumps.App):
         self.item_turbo.title = check(self.preset == "turbo") + "โมเดล: turbo (เร็ว+แม่น · แนะนำ)"
         self.item_large.title = check(self.preset == "large-v3") + "โมเดล: large-v3 (แม่นสุด · ช้ากว่ามาก)"
         self.item_pause.title = "เปิดใช้งานต่อ" if self.state == "paused" else "พักการใช้งาน"
+        self.item_stream.title = ("✅ " if self.streaming_on() else "") + "ทยอยพิมพ์ระหว่างพูด"
 
-    def open_about(self, _):
-        subprocess.Popen(["open", "https://github.com/RonnyBBA/ron-dictate"])
+    def toggle_streaming(self, _):
+        self.cfg["streaming"] = not self.streaming_on()
+        save_config(self.cfg)
+        self.refresh_menu()
 
     # ---------- Model ----------
 
     def load_model(self):
-        if not FFMPEG:
-            self.item_status.title = "❌ ไม่พบ ffmpeg — รัน ติดตั้ง.command ก่อน"
-            log("ไม่พบ ffmpeg (bin/ffmpeg หรือใน PATH)")
-            play(SOUND_ERROR)
-            return
         engine, model_id = PRESETS[self.preset]
         try:
             log("โหลดโมเดล %s (%s) ..." % (self.preset, engine))
@@ -231,13 +252,12 @@ class Dictate(rumps.App):
             t0 = time.time()
             if engine == "mlx":
                 import mlx_whisper
-                # อุ่นเครื่อง: ถอดเสียงเงียบสั้นๆ ให้โมเดลขึ้น GPU ค้างไว้
+                # อุ่นเครื่อง: ถอดเสียงเงียบสั้นๆ 1 ครั้ง ให้โมเดลขึ้น GPU ค้างไว้
                 silence = tempfile.mktemp(suffix=".wav", prefix="ron_dictate_warm_")
                 subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
                                 "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
                                 "-t", "0.3", silence], check=True)
-                mlx_whisper.transcribe(silence, path_or_hf_repo=model_id,
-                                       language=self.cfg.get("language", "th"))
+                mlx_whisper.transcribe(silence, path_or_hf_repo=model_id, language="th")
                 os.remove(silence)
                 self.model = ("mlx", model_id)
             else:
@@ -274,7 +294,7 @@ class Dictate(rumps.App):
             if not check_permissions():
                 self.item_status.title = "⚠️ กด Allow ใน System Settings แล้วเปิดแอปใหม่"
             hotkey = getattr(keyboard.Key, self.cfg.get("hotkey", "alt_l"), keyboard.Key.alt_l)
-            # "จิ้มเดี่ยว" เท่านั้นถึงทำงาน — กด ⌥ ประกอบปุ่มอื่น (⌥+ลูกศร ฯลฯ) ไม่นับ
+            # "จิ้มเดี่ยว" เท่านั้นถึงทำงาน — ถ้ากด ⌥ ประกอบปุ่มอื่น (⌥+ลูกศร ฯลฯ) ไม่นับ
             held = {"down": False, "combo": False}
 
             def on_press(key):
@@ -300,9 +320,28 @@ class Dictate(rumps.App):
 
     def on_hotkey(self):
         if self.state == "idle":
-            self.start_recording()
+            # เริ่มอัด = ต้อง "ดับเบิลจิ้ม" (2 ทีภายใน 0.5 วิ) — กันเผลอจิ้มทีเดียวแล้วอัดค้าง
+            now = time.time()
+            if now - self.last_tap <= 0.5:
+                self.last_tap = 0.0
+                self.start_recording()
+            else:
+                self.last_tap = now
         elif self.state == "recording":
-            threading.Thread(target=self.stop_and_transcribe, daemon=True).start()
+            if self.streaming_on():
+                # โหมดทยอย: แค่เปลี่ยนสถานะ stream_worker จะปิดงานเอง
+                self.state = "transcribing"
+                play(SOUND_STOP)
+            else:
+                threading.Thread(target=self.stop_and_transcribe, daemon=True).start()
+        elif self.state == "transcribing":
+            # ปุ่มฉุกเฉิน: จิ้มระหว่าง ⏳ = ยกเลิกทั้งหมด หยุดวางทันที
+            self.cancel = True
+            log("ผู้ใช้สั่งยกเลิก (จิ้มระหว่างถอด)")
+            play(SOUND_ERROR)
+
+    def streaming_on(self):
+        return bool(self.cfg.get("streaming", True))
 
     def toggle_pause(self, _):
         if self.state == "paused":
@@ -320,6 +359,22 @@ class Dictate(rumps.App):
                 self.item_status.title = "❌ หาไมค์ไม่เจอ"
                 play(SOUND_ERROR)
                 return
+        self.cancel = False
+        if self.streaming_on():
+            # โหมดทยอย: อัดหั่นเป็นท่อนละ 6 วิ ถอด+วางระหว่างพูดเลย
+            self.seg_dir = tempfile.mkdtemp(prefix="ron_dictate_seg_")
+            cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                   "-f", "avfoundation", "-i", ":" + self.mic,
+                   "-ar", "16000", "-ac", "1",
+                   "-f", "segment", "-segment_time", "6", "-reset_timestamps", "1",
+                   os.path.join(self.seg_dir, "seg_%03d.wav")]
+            self.rec_proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.state = "recording"
+            log("เริ่มอัด (ทยอย) → %s" % self.seg_dir)
+            play(SOUND_START)
+            threading.Thread(target=self.stream_worker, daemon=True).start()
+            return
         self.rec_path = tempfile.mktemp(suffix=".wav", prefix="ron_dictate_")
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
                "-f", "avfoundation", "-i", ":" + self.mic,
@@ -329,6 +384,83 @@ class Dictate(rumps.App):
         self.state = "recording"
         log("เริ่มอัด → %s" % self.rec_path)
         play(SOUND_START)
+
+    def stream_worker(self):
+        """ถอด+วางทีละท่อนระหว่างที่ยังพูดอยู่ — พูดจบเหลือรอแค่ท่อนสุดท้าย
+        กันภัย 4 ชั้น: ท่อนเงียบไม่ถอด · คำมโนซ้ำไม่วาง · เงียบนานหยุดเอง · จิ้มยกเลิกได้"""
+        import glob as globmod
+        proc, seg_dir = self.rec_proc, self.seg_dir
+        done, text_all, ffmpeg_closed = set(), "", False
+        silent_run, t_stop = 0, None
+        try:
+            while True:
+                if self.cancel:
+                    log("ยกเลิกแล้ว — ทิ้งท่อนที่เหลือทั้งหมด")
+                    break
+                if self.state != "recording" and not ffmpeg_closed:
+                    t_stop = time.time()
+                    try:
+                        proc.send_signal(signal.SIGINT)
+                        proc.wait(timeout=10)
+                    except Exception:
+                        proc.kill()
+                    ffmpeg_closed = True
+                files = sorted(globmod.glob(os.path.join(seg_dir, "seg_*.wav")))
+                ready = files if ffmpeg_closed else files[:-1]  # ตัวท้ายยังเขียนอยู่
+                for f in ready:
+                    if f in done or self.cancel:
+                        continue
+                    done.add(f)
+                    try:
+                        if os.path.getsize(f) < 26000 and ffmpeg_closed and f == files[-1] and text_all:
+                            continue  # เศษท้ายสั้นเกิน ข้าม
+                        if wav_is_silent(f, self.cfg.get("silence_rms", 250)):
+                            silent_run += 1
+                            log("ท่อน %s ข้าม (เงียบ) · เงียบติดกัน %d" % (os.path.basename(f), silent_run))
+                            continue
+                        txt, secs = self.transcribe(f, prev=text_all)
+                        if txt and looks_hallucinated(txt):
+                            log("ท่อน %s ทิ้ง (มโนซ้ำ): %s" % (os.path.basename(f), txt[:40]))
+                            continue
+                        if txt:
+                            silent_run = 0
+                            self.paste_text((" " if text_all else "") + txt)
+                            text_all += (" " if text_all else "") + txt
+                            log("ท่อน %s ถอด %.1fs → %s" % (os.path.basename(f), secs, txt[:60]))
+                        else:
+                            silent_run += 1
+                    except Exception:
+                        log("ถอดท่อนพัง:\n" + traceback.format_exc())
+                # เงียบต่อเนื่อง ~20 วิ (3 ท่อน) = คงเผลอเปิดค้าง → หยุดเอง
+                if self.state == "recording" and silent_run >= 3:
+                    log("เงียบนานเกิน — หยุดอัดอัตโนมัติ")
+                    self.item_status.title = "หยุดเอง (ไม่ได้ยินเสียงพูดนาน)"
+                    self.state = "transcribing"
+                    play(SOUND_STOP)
+                if ffmpeg_closed and len(done) == len(globmod.glob(os.path.join(seg_dir, "seg_*.wav"))):
+                    break
+                time.sleep(0.4)
+            if self.cancel:
+                self.item_status.title = "ยกเลิกแล้ว"
+            elif text_all:
+                wait = (time.time() - t_stop) if t_stop else 0
+                log("จบ (ทยอย) รวม %d ตัวอักษร · รอหลังกดหยุด %.1fs" % (len(text_all), wait))
+                self.item_status.title = "ล่าสุด: %s" % (text_all[:40] + ("…" if len(text_all) > 40 else ""))
+                play(SOUND_DONE)
+            else:
+                log("ไม่ได้ยินเสียงพูด (ทยอย)")
+                self.item_status.title = "ไม่ได้ยินเสียงพูด — ลองใหม่"
+                play(SOUND_ERROR)
+        finally:
+            if not ffmpeg_closed:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            shutil.rmtree(seg_dir, ignore_errors=True)
+            self.rec_proc = None
+            self.cancel = False
+            self.state = "idle"
 
     def stop_and_transcribe(self):
         self.state = "transcribing"
@@ -350,7 +482,18 @@ class Dictate(rumps.App):
         except OSError:
             pass
         try:
+            if wav_is_silent(path, self.cfg.get("silence_rms", 250)):
+                log("ข้าม (เงียบทั้งคลิป)")
+                self.item_status.title = "ไม่ได้ยินเสียงพูด — ลองใหม่"
+                play(SOUND_ERROR)
+                return
             text, secs = self.transcribe(path)
+            if text and looks_hallucinated(text):
+                log("ทิ้ง (มโนซ้ำ): %s" % text[:40])
+                text = ""
+            if self.cancel:
+                log("ยกเลิกแล้ว — ไม่วางข้อความ")
+                text = ""
             if text:
                 self.paste_text(text)
                 log("ถอดเสร็จ %.1fs → %d ตัวอักษร: %s" % (secs, len(text), text[:120]))
@@ -371,13 +514,18 @@ class Dictate(rumps.App):
                 pass
             self.state = "idle"
 
-    def transcribe(self, path):
+    def transcribe(self, path, prev=""):
         t0 = time.time()
         engine, m = self.model
         lang = self.cfg.get("language", "th")
-        # ป้อนคลังศัพท์เฉพาะของคุณ ให้โมเดลเดาคำพวกนี้ถูกขึ้น — เติมได้ใน config.json
+        # ป้อนคลังศัพท์เฉพาะของรอน + ข้อความท่อนก่อนหน้า (โหมดทยอย) ให้ต่อเนื่องถูกบริบท
         vocab = self.cfg.get("vocab") or []
-        prompt = ("ศัพท์เฉพาะที่ใช้บ่อย: " + ", ".join(vocab)) if vocab else None
+        parts = []
+        if vocab:
+            parts.append("ศัพท์เฉพาะที่ใช้บ่อย: " + ", ".join(vocab))
+        if prev:
+            parts.append("ข้อความก่อนหน้า: " + prev[-150:])
+        prompt = " · ".join(parts) if parts else None
         if engine == "mlx":
             import mlx_whisper
             r = mlx_whisper.transcribe(path, path_or_hf_repo=m, language=lang,
@@ -398,12 +546,12 @@ class Dictate(rumps.App):
         p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
         p.communicate(text.encode("utf-8"))
         time.sleep(0.15)
-        # ยิงปุ่ม V ตามตำแหน่งฮาร์ดแวร์ (vk=9) — คีย์บอร์ดภาษาไทย/อะไรก็วางเข้า
+        # ยิงปุ่ม V ตามตำแหน่งฮาร์ดแวร์ (vk=9) — คีย์บอร์ดภาษาไทยอยู่ก็วางเข้า
         v_key = keyboard.KeyCode.from_vk(9)
         with self.kb.pressed(keyboard.Key.cmd):
             self.kb.press(v_key)
             self.kb.release(v_key)
-        # ข้อความค้างใน clipboard — วางซ้ำเองด้วย Cmd+V ได้เสมอ
+        # ไม่คืน clipboard เดิม — ข้อความค้างใน clipboard เผื่อวางซ้ำเองด้วย Cmd+V ได้
 
     def do_quit(self, _):
         if self.rec_proc:
@@ -412,5 +560,5 @@ class Dictate(rumps.App):
 
 
 if __name__ == "__main__":
-    log("=== Ron Dictate เริ่มทำงาน (%s) ===" % ("Apple Silicon" if IS_APPLE_SILICON else "Intel"))
+    log("=== Ron Dictate เริ่มทำงาน ===")
     Dictate().run()
