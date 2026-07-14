@@ -173,8 +173,30 @@ class Dictate(rumps.App):
         self.refresh_menu()
 
         rumps.Timer(self.update_title, 0.25).start()
+        rumps.Timer(self.keep_warm, 600).start()  # กันโมเดลโดนเตะไป swap ตอนเครื่องแรมตึง
         threading.Thread(target=self.load_model, daemon=True).start()
         threading.Thread(target=self.hotkey_listener, daemon=True).start()
+
+    def keep_warm(self, _timer=None):
+        if self.state != "idle" or not self.model:
+            return
+        threading.Thread(target=self._warm_once, daemon=True).start()
+
+    def _warm_once(self):
+        try:
+            engine, m = self.model
+            if engine != "mlx" or self.state != "idle":
+                return
+            import mlx_whisper
+            silence = tempfile.mktemp(suffix=".wav", prefix="ron_dictate_warm_")
+            subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                            "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
+                            "-t", "0.3", silence], check=True)
+            mlx_whisper.transcribe(silence, path_or_hf_repo=m, language="th")
+            os.remove(silence)
+        except Exception:
+            pass
+
 
     # ---------- UI ----------
 
@@ -318,6 +340,15 @@ class Dictate(rumps.App):
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+        # จิ้มติดกันเร็วเกิน (อัด < 0.8 วิ) = ไม่ถอด — กัน Whisper มโนคำจากความเงียบ
+        try:
+            if os.path.getsize(path) < 26000:  # 16kHz mono 16bit ≈ 32KB/วิ
+                log("อัดสั้นเกิน (จิ้มพลาด) — ข้าม")
+                os.remove(path)
+                self.state = "idle"
+                return
+        except OSError:
+            pass
         try:
             text, secs = self.transcribe(path)
             if text:
