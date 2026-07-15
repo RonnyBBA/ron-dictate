@@ -196,7 +196,11 @@ class Dictate(rumps.App):
         self.preset = self.cfg.get("preset", "turbo")
         if self.preset not in PRESETS:
             self.preset = "turbo"
-        self.session = 0          # เลขรุ่นของรอบอัด — เพิ่มทุกครั้งที่เริ่ม/ยกเลิก
+        self.session = 0      # เลขรุ่นของรอบอัด — เพิ่มทุกครั้งที่เริ่มรอบใหม่
+        self.stop_gen = 0     # รอบ ≤ ค่านี้ = ถูกสั่งหยุดอัดแล้ว
+        self.cancel_gen = 0   # รอบ ≤ ค่านี้ = โมฆะ ห้ามวางข้อความ
+        self.prev_done = None  # Event ของ worker รอบก่อน — ไว้เรียงลำดับการวางข้าม 2 รอบ
+        self.gpu_lock = threading.Lock()  # mlx/Metal ห้ามยิงพร้อมกัน 2 เธรด (เคย crash ทั้งโปรเซส)
         self.rec_proc = None
         self.mic = None
         self.last_tap = 0.0
@@ -251,10 +255,11 @@ class Dictate(rumps.App):
         self.refresh_menu()
 
     def cancel_now(self, _=None):
-        """ยกเลิกรอบที่ค้าง (จากเมนูบาร์) — เพิ่มเลขรุ่น = ทุกงานเก่ากลายเป็นโมฆะทันที"""
+        """ยกเลิกทุกรอบที่ค้าง (จากเมนูบาร์) — ทุกงาน ≤ รุ่นปัจจุบันกลายเป็นโมฆะทันที"""
         if self.state not in ("recording", "transcribing"):
             return
-        self.session += 1
+        self.cancel_gen = self.session
+        self.stop_gen = self.session
         proc, self.rec_proc = self.rec_proc, None
         if proc:
             try:
@@ -262,7 +267,7 @@ class Dictate(rumps.App):
             except Exception:
                 pass
         self.state = "idle"
-        log("ยกเลิกจากเมนู (รุ่นใหม่ = %d)" % self.session)
+        log("ยกเลิกจากเมนู (โมฆะถึงรุ่น %d)" % self.cancel_gen)
         self.item_status.title = "ยกเลิกแล้ว"
         play(SOUND_ERROR)
 
@@ -316,15 +321,20 @@ class Dictate(rumps.App):
 
     def _warm_once(self):
         try:
-            if self.state != "idle" or not self.model or self.model[0] != "mlx":
+            if self.state != "idle" or not self.model:
                 return
-            import mlx_whisper
-            silence = tempfile.mktemp(suffix=".wav", prefix="ron_dictate_warm_")
-            subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
-                            "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
-                            "-t", "0.3", silence], check=True)
-            mlx_whisper.transcribe(silence, path_or_hf_repo=self.model[1], language="th")
-            os.remove(silence)
+            if not self.gpu_lock.acquire(blocking=False):
+                return  # GPU มีงานอยู่ = อุ่นอยู่แล้วโดยปริยาย
+            try:
+                import mlx_whisper
+                silence = tempfile.mktemp(suffix=".wav", prefix="ron_dictate_warm_")
+                subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                                "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
+                                "-t", "0.3", silence], check=True)
+                mlx_whisper.transcribe(silence, path_or_hf_repo=self.model[1], language="th")
+                os.remove(silence)
+            finally:
+                self.gpu_lock.release()
         except Exception:
             pass
 
@@ -381,11 +391,13 @@ class Dictate(rumps.App):
         if self.state == "idle":
             self.start_recording()
         elif self.state == "recording":
-            self.state = "transcribing"  # worker ของรุ่นปัจจุบันเห็นแล้วปิดงานเอง
+            self.stop_gen = self.session
+            self._close_recorder(self.rec_proc)  # ปิดไมค์เดี๋ยวนั้นเลย ไม่รอลูป (เคยอัดเกินไป 10-30 วิ)
+            self.state = "transcribing"
             play(SOUND_STOP)
         elif self.state == "transcribing":
-            play(SOUND_WAIT)  # กำลังถอดอยู่ — บอกเฉยๆ ไม่ยกเลิก (ยกเลิก = เมนูบาร์)
-            self.item_status.title = "กำลังถอดท้ายเสียง รอแป๊บ..."
+            # ไม่ต้องรอรอบเก่าเก็บท้ายเสียง — เริ่มพูดรอบใหม่ได้ทันที (ข้อความยังเรียงลำดับถูก)
+            self.start_recording()
         else:
             play(SOUND_ERROR)  # loading/paused — มีเสียงตอบเสมอ ไม่เงียบใส่
 
@@ -400,6 +412,9 @@ class Dictate(rumps.App):
                 return
         self.session += 1
         my_session = self.session
+        prev_done = self.prev_done          # worker รอบก่อน (ไว้รอเรียงลำดับวาง)
+        done_evt = threading.Event()
+        self.prev_done = done_evt
         seg_dir = tempfile.mkdtemp(prefix="ron_dictate_seg_")
         seg_time = "5" if self.cfg.get("streaming", True) else "3600"
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
@@ -413,29 +428,44 @@ class Dictate(rumps.App):
         log("เริ่มอัด (รุ่น %d) → %s" % (my_session, seg_dir))
         play(SOUND_START)
         threading.Thread(target=self.stream_worker,
-                         args=(my_session, self.rec_proc, seg_dir), daemon=True).start()
+                         args=(my_session, self.rec_proc, seg_dir, prev_done, done_evt),
+                         daemon=True).start()
 
     def alive(self, my_session):
-        """รอบนี้ยังเป็นรุ่นปัจจุบันไหม — ถ้าไม่ = ถูกยกเลิก/มีรอบใหม่แทนแล้ว ห้ามทำอะไรต่อ"""
-        return self.session == my_session
+        """รอบนี้ยังไม่ถูกยกเลิกใช่ไหม (รอบใหม่เริ่มได้โดยรอบเก่ายังเก็บงานต่อเบื้องหลัง)"""
+        return my_session > self.cancel_gen
 
-    def stream_worker(self, my_session, proc, seg_dir):
+    @staticmethod
+    def _close_recorder(proc):
+        """ส่ง SIGINT ให้ ffmpeg ปิดไฟล์สวยๆ — รอในเธรดแยก ไม่บล็อกใคร"""
+        if not proc or proc.poll() is not None:
+            return
+        def _do():
+            try:
+                proc.send_signal(signal.SIGINT)
+                proc.wait(timeout=10)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        threading.Thread(target=_do, daemon=True).start()
+
+    def stream_worker(self, my_session, proc, seg_dir, prev_done, done_evt):
         import glob as globmod
         done, text_all, ffmpeg_closed = set(), "", False
-        silent_run, t_stop = 0, None
+        silent_run, t_stop, waited_prev = 0, None, False
         try:
             while True:
                 if not self.alive(my_session):
-                    log("รุ่น %d ตกรุ่น — จบเงียบๆ" % my_session)
+                    log("รุ่น %d ถูกยกเลิก — จบเงียบๆ" % my_session)
                     return
-                if self.state != "recording" and not ffmpeg_closed:
-                    t_stop = time.time()
-                    try:
-                        proc.send_signal(signal.SIGINT)
-                        proc.wait(timeout=10)
-                    except Exception:
-                        proc.kill()
-                    ffmpeg_closed = True
+                if not ffmpeg_closed and self.stop_gen >= my_session:
+                    if t_stop is None:
+                        t_stop = time.time()
+                    self._close_recorder(proc)  # เผื่อกรณี auto-stop ที่ยังไม่มีใครปิด
+                    if proc.poll() is not None:
+                        ffmpeg_closed = True  # ไฟล์ท่อนสุดท้ายปิดสมบูรณ์แล้ว
                 files = sorted(globmod.glob(os.path.join(seg_dir, "seg_*.wav")))
                 ready = files if ffmpeg_closed else files[:-1]
                 for f in ready:
@@ -443,19 +473,25 @@ class Dictate(rumps.App):
                         continue
                     done.add(f)
                     try:
-                        if os.path.getsize(f) < 26000 and ffmpeg_closed and f == files[-1] and text_all:
+                        # เศษท้ายสั้นกว่า ~1.2 วิ หลังจิ้มหยุด = เสียงค้าง ไม่ใช่คำพูด (ถ้ามีข้อความแล้ว)
+                        if os.path.getsize(f) < 38000 and ffmpeg_closed and f == files[-1] and text_all:
+                            log("ทิ้งเศษท้ายสั้น (%dKB)" % (os.path.getsize(f) // 1024))
                             continue
                         if wav_is_silent(f, self.cfg.get("silence_rms", 250)):
                             silent_run += 1
                             log("ท่อน %s ข้าม (เงียบ %d)" % (os.path.basename(f), silent_run))
                             continue
                         txt, secs = self.transcribe(f, prev=text_all)
-                        # 🔑 เช็คเลขรุ่น "หลังถอดเสร็จ ก่อนวาง" — หัวใจของการแก้บั๊ก ensch
+                        # 🔑 เช็ค "ถูกยกเลิก?" หลังถอดเสร็จ ก่อนวางเสมอ
                         if not self.alive(my_session):
-                            log("ถอดเสร็จแต่ตกรุ่นแล้ว — ทิ้ง: %s" % txt[:30])
+                            log("ถอดเสร็จแต่ถูกยกเลิกแล้ว — ทิ้ง: %s" % txt[:30])
                             return
                         if txt:
                             silent_run = 0
+                            # ถ้ารอบก่อนยังเก็บท้ายไม่จบ รอให้วางครบก่อน (ข้อความจะได้เรียงถูก)
+                            if prev_done and not waited_prev:
+                                prev_done.wait(60)
+                                waited_prev = True
                             self.paste_text((" " if text_all else "") + txt)
                             text_all += (" " if text_all else "") + txt
                             log("ท่อน %s ถอด %.1fs → %s" % (os.path.basename(f), secs, txt[:60]))
@@ -463,31 +499,36 @@ class Dictate(rumps.App):
                             silent_run += 1
                     except Exception:
                         log("ถอดท่อนพัง:\n" + traceback.format_exc())
-                if self.state == "recording" and silent_run >= 3:
+                if not ffmpeg_closed and silent_run >= 3:
                     log("เงียบนาน — หยุดอัดเอง (รุ่น %d)" % my_session)
-                    self.item_status.title = "หยุดเอง (ไม่ได้ยินเสียงพูดนาน)"
-                    self.state = "transcribing"
-                    play(SOUND_STOP)
+                    self.stop_gen = max(self.stop_gen, my_session)
+                    if self.session == my_session:
+                        self.item_status.title = "หยุดเอง (ไม่ได้ยินเสียงพูดนาน)"
+                        self.state = "transcribing"
+                        play(SOUND_STOP)
                 if ffmpeg_closed and len(done) == len(globmod.glob(os.path.join(seg_dir, "seg_*.wav"))):
                     break
                 time.sleep(0.4)
             if text_all:
                 wait = (time.time() - t_stop) if t_stop else 0
                 log("จบรุ่น %d · %d ตัวอักษร · รอหลังหยุด %.1fs" % (my_session, len(text_all), wait))
-                self.item_status.title = "ล่าสุด: %s" % (text_all[:40] + ("…" if len(text_all) > 40 else ""))
+                if self.session == my_session:
+                    self.item_status.title = "ล่าสุด: %s" % (text_all[:40] + ("…" if len(text_all) > 40 else ""))
                 play(SOUND_DONE)
             else:
                 log("จบรุ่น %d — ไม่ได้ยินเสียงพูด" % my_session)
-                self.item_status.title = "ไม่ได้ยินเสียงพูด — ลองใหม่"
+                if self.session == my_session:
+                    self.item_status.title = "ไม่ได้ยินเสียงพูด — ลองใหม่"
                 play(SOUND_ERROR)
         finally:
+            done_evt.set()
             if not ffmpeg_closed:
                 try:
                     proc.kill()
                 except Exception:
                     pass
             shutil.rmtree(seg_dir, ignore_errors=True)
-            if self.alive(my_session):
+            if self.session == my_session:  # เฉพาะรอบล่าสุดเท่านั้นที่แตะสถานะรวม
                 self.rec_proc = None
                 self.state = "idle"
 
@@ -495,7 +536,9 @@ class Dictate(rumps.App):
 
     def transcribe(self, path, prev=""):
         t0 = time.time()
-        engine, m = self.model
+        _engine, model_id = self.model
+        if _engine == "mlx":
+            import mlx_whisper
         parts = []
         vocab = self.cfg.get("vocab") or []
         if vocab:
@@ -503,16 +546,17 @@ class Dictate(rumps.App):
         if prev:
             parts.append("ข้อความก่อนหน้า: " + prev[-150:])
         prompt = " · ".join(parts) or None
-        if engine == "mlx":
-            import mlx_whisper
-            r = mlx_whisper.transcribe(path, path_or_hf_repo=m,
-                                       language=self.cfg.get("language", "th"),
-                                       initial_prompt=prompt)
-            text = clean_segments(r.get("segments", []))
-        else:
-            segs, _info = m.transcribe(path, language=self.cfg.get("language", "th"),
-                                       beam_size=5, vad_filter=True, initial_prompt=prompt)
-            text = clean_segments(list(segs))
+        with self.gpu_lock:  # ถอดทีละงาน — mlx/Metal ชนกันแล้ว crash ทั้งโปรเซส
+            if _engine == "mlx":
+                r = mlx_whisper.transcribe(path, path_or_hf_repo=model_id,
+                                           language=self.cfg.get("language", "th"),
+                                           initial_prompt=prompt)
+                segs = r.get("segments", [])
+            else:
+                s, _info = model_id.transcribe(path, language=self.cfg.get("language", "th"),
+                                               beam_size=5, vad_filter=True, initial_prompt=prompt)
+                segs = list(s)
+        text = clean_segments(segs)
         for wrong, right in (self.cfg.get("corrections") or {}).items():
             text = text.replace(wrong, right)
         return text, time.time() - t0
@@ -527,7 +571,7 @@ class Dictate(rumps.App):
             self.kb.release(v_key)
 
     def do_quit(self, _):
-        self.session += 1
+        self.cancel_gen = self.session
         if self.rec_proc:
             try:
                 self.rec_proc.kill()
