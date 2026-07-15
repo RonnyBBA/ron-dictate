@@ -133,13 +133,20 @@ def wav_is_silent(path, rms_threshold=250):
 
 
 def looks_hallucinated(text):
-    """จับอาการ Whisper มโนคำซ้ำๆ จากความเงียบ (เช่น 'Mess Mess Mess ...')"""
+    """จับอาการ Whisper มโนจากความเงียบ — ทั้งคำซ้ำ ('Mess Mess ...') และอักษรติดกันยาว ('ทททท...')"""
     words = text.split()
     if len(words) >= 5 and len(set(words)) <= 2:
         return True
     for i in range(len(words) - 4):
         if len(set(words[i:i + 5])) == 1:
             return True
+    # ตัวอักษรเดียวกันติดกัน ≥8 ตัว (ทททททททท / ๆๆๆๆๆๆๆๆ) = มโนแน่นอน
+    run, prev = 1, ""
+    for ch in text:
+        run = run + 1 if ch == prev else 1
+        if run >= 8:
+            return True
+        prev = ch
     return False
 
 
