@@ -61,7 +61,7 @@ DEFAULT_CONFIG = {
     "language": "th",
     "hotkey": "alt_l",
     "mic_substring": "MacBook",
-    "streaming": True,
+    "streaming": False,
     "silence_rms": 250,
     "vocab": [],
     "corrections": {},
