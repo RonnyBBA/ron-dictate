@@ -204,6 +204,7 @@ class Dictate(rumps.App):
         self.rec_proc = None
         self.mic = None
         self.last_tap = 0.0
+        self.want_start = False  # จิ้มตอนกำลังโหลด = จองคิว พอพร้อมเริ่มอัดให้เอง
         self.kb = keyboard.Controller()
 
         self.item_status = rumps.MenuItem("กำลังโหลดโมเดล...")
@@ -298,6 +299,10 @@ class Dictate(rumps.App):
             self.item_status.title = "พร้อมใช้ — จิ้ม ⌥ ซ้าย เพื่อพูด"
             if self.state == "loading":
                 self.state = "idle"
+            if self.want_start:
+                self.want_start = False
+                log("เริ่มอัดให้เอง (จองคิวไว้ตอนโหลด)")
+                self.start_recording()
         except Exception:
             log("โหลดโมเดลพัง:\n" + traceback.format_exc())
             self.item_status.title = "❌ โหลดโมเดลไม่สำเร็จ (ดู dictate.log)"
@@ -398,8 +403,12 @@ class Dictate(rumps.App):
         elif self.state == "transcribing":
             # ไม่ต้องรอรอบเก่าเก็บท้ายเสียง — เริ่มพูดรอบใหม่ได้ทันที (ข้อความยังเรียงลำดับถูก)
             self.start_recording()
+        elif self.state == "loading":
+            self.want_start = True
+            self.item_status.title = "กำลังโหลด... พร้อมแล้วจะเริ่มอัดให้เลย"
+            play(SOUND_WAIT)
         else:
-            play(SOUND_ERROR)  # loading/paused — มีเสียงตอบเสมอ ไม่เงียบใส่
+            play(SOUND_ERROR)
 
     # ---------- Record + Stream ----------
 
