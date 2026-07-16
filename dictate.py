@@ -117,7 +117,7 @@ def check_permissions():
 
 
 def wav_is_silent(path, rms_threshold=250):
-    """ความเงียบ = ไม่ต้องถอดเลย (ชั้นกรองที่ 1 — เร็ว ฟรี)"""
+    """สำรอง: วัดความดังดิบ (ใช้เมื่อ VAD ใช้ไม่ได้)"""
     try:
         import wave, audioop
         with wave.open(path) as w:
@@ -125,6 +125,18 @@ def wav_is_silent(path, rms_threshold=250):
         return audioop.rms(frames, 2) < rms_threshold
     except Exception:
         return False
+
+
+def has_speech(path, rms_threshold=250):
+    """ด่านกรองที่ 1: Silero VAD (ตัวเดียวกับที่แอปดังใช้ · 0.05 วิ/ท่อน)
+    กันทั้งถอดความเงียบทิ้งเปล่าๆ และกัน Whisper นั่งมโนกับเสียงรบกวนนาน 20 วิ"""
+    try:
+        from faster_whisper.vad import get_speech_timestamps, VadOptions
+        from faster_whisper.audio import decode_audio
+        audio = decode_audio(path, sampling_rate=16000)
+        return len(get_speech_timestamps(audio, VadOptions(min_speech_duration_ms=250))) > 0
+    except Exception:
+        return not wav_is_silent(path, rms_threshold)
 
 
 def looks_hallucinated(text):
@@ -210,12 +222,15 @@ class Dictate(rumps.App):
         self.item_status = rumps.MenuItem("กำลังโหลดโมเดล...")
         self.item_cancel = rumps.MenuItem("🛑 ยกเลิกที่ค้างอยู่", callback=self.cancel_now)
         self.item_pause = rumps.MenuItem("พักการใช้งาน", callback=self.toggle_pause)
-        self.item_stream = rumps.MenuItem("ทยอยพิมพ์ระหว่างพูด", callback=self.toggle_streaming)
+        self.item_hybrid = rumps.MenuItem("", callback=lambda _: self.set_mode("hybrid"))
+        self.item_live = rumps.MenuItem("", callback=lambda _: self.set_mode("live"))
+        self.item_single = rumps.MenuItem("", callback=lambda _: self.set_mode("single"))
         self.item_turbo = rumps.MenuItem("", callback=lambda _: self.switch_model("turbo"))
         self.item_large = rumps.MenuItem("", callback=lambda _: self.switch_model("large-v3"))
         self.menu = [
             self.item_status, None,
-            self.item_cancel, self.item_pause, self.item_stream, None,
+            self.item_cancel, self.item_pause, None,
+            self.item_hybrid, self.item_live, self.item_single, None,
             self.item_turbo, self.item_large, None,
             rumps.MenuItem("Quit", callback=self.do_quit),
         ]
@@ -236,15 +251,22 @@ class Dictate(rumps.App):
         if self.title != want:
             self.title = want
 
+    def mode(self):
+        m = self.cfg.get("mode", "hybrid")
+        return m if m in MODES else "hybrid"
+
     def refresh_menu(self):
         check = lambda a: "✅ " if a else ""
+        m = self.mode()
+        self.item_hybrid.title = check(m == "hybrid") + "โหมด: ไฮบริด — พูดยาวได้ วางทีเดียว รอ 2-4 วิ (แนะนำ)"
+        self.item_live.title = check(m == "live") + "โหมด: ทยอยวางสดระหว่างพูด"
+        self.item_single.title = check(m == "single") + "โหมด: ถอดทีเดียวตอนจบ (รอนานตามที่พูด)"
         self.item_turbo.title = check(self.preset == "turbo") + "โมเดล: turbo (เร็วสุด · แนะนำ)"
         self.item_large.title = check(self.preset == "large-v3") + "โมเดล: large-v3 (แม่นกว่านิด · ช้ากว่า 2 เท่า)"
-        self.item_stream.title = check(self.cfg.get("streaming", True)) + "ทยอยพิมพ์ระหว่างพูด"
         self.item_pause.title = "เปิดใช้งานต่อ" if self.state == "paused" else "พักการใช้งาน"
 
-    def toggle_streaming(self, _):
-        self.cfg["streaming"] = not self.cfg.get("streaming", True)
+    def set_mode(self, m):
+        self.cfg["mode"] = m
         save_config(self.cfg)
         self.refresh_menu()
 
@@ -404,11 +426,12 @@ class Dictate(rumps.App):
             # ไม่ต้องรอรอบเก่าเก็บท้ายเสียง — เริ่มพูดรอบใหม่ได้ทันที (ข้อความยังเรียงลำดับถูก)
             self.start_recording()
         elif self.state == "loading":
+            # จองคิวไว้ — โหลดเสร็จปุ๊บจะป๊อปแล้วเริ่มอัดให้เอง ไม่ต้องจิ้มซ้ำ
             self.want_start = True
             self.item_status.title = "กำลังโหลด... พร้อมแล้วจะเริ่มอัดให้เลย"
             play(SOUND_WAIT)
         else:
-            play(SOUND_ERROR)
+            play(SOUND_ERROR)  # paused — มีเสียงตอบเสมอ ไม่เงียบใส่
 
     # ---------- Record + Stream ----------
 
@@ -425,7 +448,7 @@ class Dictate(rumps.App):
         done_evt = threading.Event()
         self.prev_done = done_evt
         seg_dir = tempfile.mkdtemp(prefix="ron_dictate_seg_")
-        seg_time = "5" if self.cfg.get("streaming", True) else "3600"
+        seg_time = str(MODES[self.mode()][0])
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
                "-f", "avfoundation", "-i", ":" + self.mic,
                "-ar", "16000", "-ac", "1",
@@ -462,8 +485,10 @@ class Dictate(rumps.App):
 
     def stream_worker(self, my_session, proc, seg_dir, prev_done, done_evt):
         import glob as globmod
+        _seg, paste_live, max_silent = MODES[self.mode()]
         done, text_all, ffmpeg_closed = set(), "", False
         silent_run, t_stop, waited_prev = 0, None, False
+        pending_break = False  # เจอช่วงเงียบคั่นกลาง → ท่อนถัดไปขึ้นย่อหน้าใหม่
         try:
             while True:
                 if not self.alive(my_session):
@@ -486,29 +511,33 @@ class Dictate(rumps.App):
                         if os.path.getsize(f) < 38000 and ffmpeg_closed and f == files[-1] and text_all:
                             log("ทิ้งเศษท้ายสั้น (%dKB)" % (os.path.getsize(f) // 1024))
                             continue
-                        if wav_is_silent(f, self.cfg.get("silence_rms", 250)):
+                        if not has_speech(f, self.cfg.get("silence_rms", 250)):
                             silent_run += 1
-                            log("ท่อน %s ข้าม (เงียบ %d)" % (os.path.basename(f), silent_run))
+                            if text_all:
+                                pending_break = True  # เว้นวรรคความคิด → ย่อหน้าใหม่
+                            log("ท่อน %s ข้าม (ไม่มีเสียงพูด %d)" % (os.path.basename(f), silent_run))
                             continue
                         txt, secs = self.transcribe(f, prev=text_all)
-                        # 🔑 เช็ค "ถูกยกเลิก?" หลังถอดเสร็จ ก่อนวางเสมอ
+                        # 🔑 เช็ค "ถูกยกเลิก?" หลังถอดเสร็จ ก่อนใช้ผลเสมอ
                         if not self.alive(my_session):
                             log("ถอดเสร็จแต่ถูกยกเลิกแล้ว — ทิ้ง: %s" % txt[:30])
                             return
                         if txt:
                             silent_run = 0
-                            # ถ้ารอบก่อนยังเก็บท้ายไม่จบ รอให้วางครบก่อน (ข้อความจะได้เรียงถูก)
-                            if prev_done and not waited_prev:
-                                prev_done.wait(60)
-                                waited_prev = True
-                            self.paste_text((" " if text_all else "") + txt)
-                            text_all += (" " if text_all else "") + txt
+                            sep = "" if not text_all else ("\n" if pending_break else " ")
+                            pending_break = False
+                            if paste_live:
+                                if prev_done and not waited_prev:
+                                    prev_done.wait(60)
+                                    waited_prev = True
+                                self.paste_text(sep + txt)
+                            text_all += sep + txt
                             log("ท่อน %s ถอด %.1fs → %s" % (os.path.basename(f), secs, txt[:60]))
                         else:
                             silent_run += 1
                     except Exception:
                         log("ถอดท่อนพัง:\n" + traceback.format_exc())
-                if not ffmpeg_closed and silent_run >= 3:
+                if not ffmpeg_closed and silent_run >= max_silent:
                     log("เงียบนาน — หยุดอัดเอง (รุ่น %d)" % my_session)
                     self.stop_gen = max(self.stop_gen, my_session)
                     if self.session == my_session:
@@ -519,6 +548,14 @@ class Dictate(rumps.App):
                     break
                 time.sleep(0.4)
             if text_all:
+                if not paste_live:
+                    # โหมดไฮบริด/ทีเดียว: วางครั้งเดียวตรงนี้ — เช็คยกเลิกรอบสุดท้ายก่อน
+                    if not self.alive(my_session):
+                        log("รุ่น %d ถูกยกเลิกก่อนวาง — ทิ้งทั้งหมด" % my_session)
+                        return
+                    if prev_done and not waited_prev:
+                        prev_done.wait(60)
+                    self.paste_text(text_all)
                 wait = (time.time() - t_stop) if t_stop else 0
                 log("จบรุ่น %d · %d ตัวอักษร · รอหลังหยุด %.1fs" % (my_session, len(text_all), wait))
                 if self.session == my_session:
@@ -546,8 +583,6 @@ class Dictate(rumps.App):
     def transcribe(self, path, prev=""):
         t0 = time.time()
         _engine, model_id = self.model
-        if _engine == "mlx":
-            import mlx_whisper
         parts = []
         vocab = self.cfg.get("vocab") or []
         if vocab:
@@ -555,16 +590,17 @@ class Dictate(rumps.App):
         if prev:
             parts.append("ข้อความก่อนหน้า: " + prev[-150:])
         prompt = " · ".join(parts) or None
-        with self.gpu_lock:  # ถอดทีละงาน — mlx/Metal ชนกันแล้ว crash ทั้งโปรเซส
+        with self.gpu_lock:  # ถอดทีละงาน กัน crash
             if _engine == "mlx":
+                import mlx_whisper
                 r = mlx_whisper.transcribe(path, path_or_hf_repo=model_id,
                                            language=self.cfg.get("language", "th"),
                                            initial_prompt=prompt)
                 segs = r.get("segments", [])
             else:
-                s, _info = model_id.transcribe(path, language=self.cfg.get("language", "th"),
-                                               beam_size=5, vad_filter=True, initial_prompt=prompt)
-                segs = list(s)
+                sg, _info = model_id.transcribe(path, language=self.cfg.get("language", "th"),
+                                                beam_size=5, initial_prompt=prompt)
+                segs = list(sg)
         text = clean_segments(segs)
         for wrong, right in (self.cfg.get("corrections") or {}).items():
             text = text.replace(wrong, right)
