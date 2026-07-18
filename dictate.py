@@ -372,21 +372,35 @@ class Dictate(rumps.App):
             if not check_permissions():
                 self.item_status.title = "⚠️ กด Allow ใน System Settings แล้วเปิดแอปใหม่"
             hotkey = getattr(keyboard.Key, self.cfg.get("hotkey", "alt_l"), keyboard.Key.alt_l)
-            held = {"down": False, "combo": False}
+            held = {"down": False, "combo": False, "ptt": False}
+
+            def maybe_ptt():
+                # ค้างเกิน 0.35 วิ (ไม่ใช่คีย์ลัดร่วม + เครื่องว่าง) = กดค้างพูด (push-to-talk)
+                time.sleep(0.35)
+                if held["down"] and not held["combo"] and self.state == "idle":
+                    held["ptt"] = True
+                    self.on_hotkey(force=True)  # เริ่มอัด
 
             def on_press(key):
                 if key == hotkey:
-                    held["down"] = True
-                    held["combo"] = False
+                    if not held["down"]:
+                        held["down"] = True
+                        held["combo"] = False
+                        held["ptt"] = False
+                        threading.Thread(target=maybe_ptt, daemon=True).start()
                 elif held["down"]:
                     held["combo"] = True
 
             def on_release(key):
                 if key == hotkey:
-                    was_combo = held["combo"]
+                    was_combo, was_ptt = held["combo"], held["ptt"]
                     held["down"] = False
-                    if not was_combo:
-                        self.on_hotkey()
+                    if was_ptt:
+                        # ปล่อยนิ้ว = หยุด+ถอดทันที (ไม่สน combo — กันอัดค้าง)
+                        if self.state == "recording":
+                            self.on_hotkey(force=True)
+                    elif not was_combo:
+                        self.on_hotkey()  # จิ้มสั้น = สลับเปิด/ปิดแบบเดิม
 
             with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
                 listener.join()
@@ -404,14 +418,16 @@ class Dictate(rumps.App):
                 log("(trigger เทส = %s)" % (cmd or "tap"))
                 if cmd == "cancel":
                     self.cancel_now()
+                elif cmd in ("hold_start", "hold_end"):
+                    self.on_hotkey(force=True)  # จำลองกดค้าง/ปล่อย (PTT)
                 else:
                     self.on_hotkey()
         except OSError:
             pass
 
-    def on_hotkey(self):
+    def on_hotkey(self, force=False):
         now = time.time()
-        if now - self.last_tap < 0.7:  # จิ้มรัว = นับครั้งเดียว
+        if not force and now - self.last_tap < 0.7:  # จิ้มรัว = นับครั้งเดียว (PTT ข้าม debounce)
             return
         self.last_tap = now
         log("จิ้ม (สถานะ: %s)" % self.state)
@@ -546,6 +562,17 @@ class Dictate(rumps.App):
                         play(SOUND_STOP)
                 if ffmpeg_closed and len(done) == len(globmod.glob(os.path.join(seg_dir, "seg_*.wav"))):
                     break
+                # เพดานท้ายเสียง: เกิน 90 วิ (เครื่องหลับ/หน่วงหนัก) = ยกเลิก ดีกว่าวางเซอร์ไพรส์ทีหลัง
+                if t_stop and time.time() - t_stop > 90:
+                    log("รุ่น %d เกินเพดานท้ายเสียง 90 วิ — ยกเลิก (ข้อความที่ได้อยู่ใน clipboard)" % my_session)
+                    if text_all:
+                        p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+                        p.communicate(text_all.encode("utf-8"))
+                    self.cancel_gen = max(self.cancel_gen, my_session)
+                    if self.session == my_session:
+                        self.item_status.title = "เครื่องหน่วงหนัก — ยกเลิกรอบนี้ (กด Cmd+V วางที่ถอดได้)"
+                    play(SOUND_ERROR)
+                    return
                 time.sleep(0.4)
             if text_all:
                 if not paste_live:
