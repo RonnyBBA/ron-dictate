@@ -7,6 +7,7 @@ Ron Dictate v3 — พูดแล้วพิมพ์ ในเครื่อ
 กันมโน: ใช้ค่าความมั่นใจของ Whisper เอง (no_speech_prob + compression_ratio) แทน blacklist
 """
 
+import difflib
 import json
 import os
 import shutil
@@ -533,11 +534,18 @@ class Dictate(rumps.App):
                                 pending_break = True  # เว้นวรรคความคิด → ย่อหน้าใหม่
                             log("ท่อน %s ข้าม (ไม่มีเสียงพูด %d)" % (os.path.basename(f), silent_run))
                             continue
-                        txt, secs = self.transcribe(f, prev=text_all)
+                        txt, secs = self.transcribe(f)
                         # 🔑 เช็ค "ถูกยกเลิก?" หลังถอดเสร็จ ก่อนใช้ผลเสมอ
                         if not self.alive(my_session):
                             log("ถอดเสร็จแต่ถูกยกเลิกแล้ว — ทิ้ง: %s" % txt[:30])
                             return
+                        # ตาข่ายกันท่อนซ้ำ: ถอดออกมาเกือบเหมือนท้ายข้อความเดิม = echo ทิ้ง
+                        if txt and text_all:
+                            a = "".join(txt.split())
+                            b = "".join(text_all.split())[-len("".join(txt.split())) or 1:]
+                            if difflib.SequenceMatcher(None, a, b).ratio() > 0.80:
+                                log("ท่อน %s ทิ้ง (ซ้ำกับที่ถอดแล้ว): %s" % (os.path.basename(f), txt[:40]))
+                                continue
                         if txt:
                             silent_run = 0
                             sep = "" if not text_all else ("\n" if pending_break else " ")
@@ -551,8 +559,11 @@ class Dictate(rumps.App):
                             log("ท่อน %s ถอด %.1fs → %s" % (os.path.basename(f), secs, txt[:60]))
                         else:
                             silent_run += 1
-                    except Exception:
-                        log("ถอดท่อนพัง:\n" + traceback.format_exc())
+                    except Exception as e:
+                        if "Failed to load audio" in str(e):
+                            log("ท่อน %s ไฟล์ยังไม่สมบูรณ์ — ข้าม (จิ้มเร็วเกิน ไม่ใช่บั๊ก)" % os.path.basename(f))
+                        else:
+                            log("ถอดท่อนพัง:\n" + traceback.format_exc())
                 if not ffmpeg_closed and silent_run >= max_silent:
                     log("เงียบนาน — หยุดอัดเอง (รุ่น %d)" % my_session)
                     self.stop_gen = max(self.stop_gen, my_session)
@@ -608,25 +619,26 @@ class Dictate(rumps.App):
     # ---------- Transcribe + Paste ----------
 
     def transcribe(self, path, prev=""):
+        # 🔴 ห้ามยัดข้อความที่ถอดแล้วกลับเข้า initial_prompt — โมเดลจะ "ลอก prompt"
+        # ออกมาแทนการฟังเสียงจริง = ประโยคซ้ำๆ
         t0 = time.time()
         _engine, model_id = self.model
-        parts = []
         vocab = self.cfg.get("vocab") or []
-        if vocab:
-            parts.append("ศัพท์เฉพาะที่ใช้บ่อย: " + ", ".join(vocab))
-        if prev:
-            parts.append("ข้อความก่อนหน้า: " + prev[-150:])
-        prompt = " · ".join(parts) or None
+        prompt = ("ศัพท์เฉพาะ: " + ", ".join(vocab)) if vocab else None
         with self.gpu_lock:  # ถอดทีละงาน กัน crash
             if _engine == "mlx":
                 import mlx_whisper
                 r = mlx_whisper.transcribe(path, path_or_hf_repo=model_id,
                                            language=self.cfg.get("language", "th"),
+                                           condition_on_previous_text=False,
+                                           # retry แค่ 2 ขั้น — 6 ขั้นเต็มทำท่อนเดียวลากได้ 30-40 วิ
+                                           temperature=(0.0, 0.2),
                                            initial_prompt=prompt)
                 segs = r.get("segments", [])
             else:
                 sg, _info = model_id.transcribe(path, language=self.cfg.get("language", "th"),
-                                                beam_size=5, initial_prompt=prompt)
+                                                beam_size=5, condition_on_previous_text=False,
+                                                temperature=[0.0, 0.2], initial_prompt=prompt)
                 segs = list(sg)
         text = clean_segments(segs)
         for wrong, right in (self.cfg.get("corrections") or {}).items():
